@@ -33,6 +33,8 @@ export interface Session {
   createdAt: string;
   difficultyMode?: "adaptive" | "fixed";
   focusTopics?: string[];
+  awaitingFollowup?: boolean;
+  followupHistory?: any[];
 }
 
 export interface Question {
@@ -57,6 +59,10 @@ export interface Question {
   feedbackImprovement: string | null;
   hintRequested: boolean;
   createdAt: string;
+  isFollowup?: boolean;
+  followupTo?: string;
+  pressureHandling?: number;
+  challengeType?: string;
 }
 
 export interface Report {
@@ -72,6 +78,7 @@ export interface Report {
   trendingTools: string[];
   expectedSeniorityBar: string;
   createdAt: string;
+  pressureHandling?: number;
 }
 
 export interface EmbeddingNode {

@@ -2,6 +2,10 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
+import multer from "multer";
+import { PDFParse } from "pdf-parse";
+import mammoth from "mammoth";
+import PDFDocument from "pdfkit";
 import { db, User, Session, Question, Report } from "./src/server/db.js";
 import { hashPassword, verifyPassword, createToken, verifyToken, verifyTokenIgnoreExp } from "./src/server/crypto.js";
 import { indexDocument, gapAnalysis } from "./src/server/rag.js";
@@ -12,6 +16,8 @@ import {
   runCoach,
   runRouter,
   runReportGenerator,
+  runAdversarialFollowUp,
+  runFollowUpEvaluator,
 } from "./src/server/agents.js";
 
 // Extend Express Request types globally to support req.user with zero type-casting hassle
@@ -266,6 +272,63 @@ async function startServer() {
     if (session.turnCount > session.maxTurns + 1) return false;
     return true;
   }
+
+  // --- Document Upload Service ---
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  });
+
+  app.post("/api/upload-document", authenticateToken, upload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file was uploaded." });
+      }
+
+      const buffer = req.file.buffer;
+      const originalname = req.file.originalname.toLowerCase();
+
+      // Magic bytes validation
+      const isPDF = buffer.slice(0, 4).toString() === "%PDF";
+      const isDOCX = buffer.slice(0, 4).toString("hex") === "504b0304"; // ZIP/DOCX
+
+      let extractedText = "";
+
+      if (isPDF) {
+        try {
+          const parser = new PDFParse(new Uint8Array(buffer));
+          const pdfData = await parser.getText();
+          extractedText = pdfData.text || "";
+        } catch (pdfErr) {
+          console.error("PDF parse failed:", pdfErr);
+          return res.status(400).json({ error: "We couldn't read that PDF — try pasting text instead." });
+        }
+      } else if (isDOCX) {
+        try {
+          const docxResult = await mammoth.extractRawText({ buffer });
+          extractedText = docxResult.value || "";
+        } catch (docxErr) {
+          console.error("DOCX parse failed:", docxErr);
+          return res.status(400).json({ error: "We couldn't read that DOCX — try pasting text instead." });
+        }
+      } else {
+        return res.status(400).json({ error: "Invalid file format. Only real PDF and DOCX files are accepted." });
+      }
+
+      if (!extractedText || !extractedText.trim()) {
+        return res.status(400).json({ error: "We couldn't extract any text from that file. Try pasting the text instead." });
+      }
+
+      return res.json({
+        text: extractedText,
+        filename: req.file.originalname,
+      });
+
+    } catch (e: any) {
+      console.error("Upload handler failed:", e);
+      return res.status(500).json({ error: "An unexpected error occurred during document processing." });
+    }
+  });
 
   // --- Session Setup ---
   app.post("/api/sessions/setup", authenticateToken, async (req, res) => {
@@ -586,60 +649,196 @@ async function startServer() {
       const question = db.getQuestionById(questionId);
       if (!question) return res.status(404).json({ error: "Question not found" });
 
-      // Calculate score & feedback using Multi-Agent flow
-      const evaluation = await runEvaluator(question, answerText);
-      const coaching = await runCoach(question, answerText, evaluation);
+      if (question.isFollowup) {
+        // Evaluate the candidate's answer to the adversarial follow-up challenge
+        const parentQuestionId = question.followupTo;
+        const parentQuestion = parentQuestionId ? db.getQuestionById(parentQuestionId) : null;
+        
+        // We evaluate pressure handling
+        const followupEval = await runFollowUpEvaluator(
+          parentQuestion || question,
+          question.questionText,
+          answerText
+        );
 
-      // Apply transparency/penalty if hint was requested
-      let finalOverallScore = evaluation.overall_score;
-      if (question.hintRequested) {
-        finalOverallScore = Math.max(1, finalOverallScore - 1);
+        // Save evaluation
+        db.updateQuestion(question.id, {
+          answerText,
+          scoreOverall: followupEval.pressure_handling,
+          pressureHandling: followupEval.pressure_handling,
+          justification: followupEval.justification,
+          scoreTechnical: followupEval.pressure_handling,
+          scoreCompleteness: followupEval.pressure_handling,
+          scoreClarity: followupEval.pressure_handling,
+          scoreRelevance: followupEval.pressure_handling,
+        });
+
+        // Add to session's followup history
+        const updatedHistory = session.followupHistory || [];
+        updatedHistory.push({
+          parentQuestionId,
+          followupQuestionText: question.questionText,
+          challengeType: question.challengeType || "scale",
+          answerText,
+          pressureScore: followupEval.pressure_handling,
+          justification: followupEval.justification,
+        });
+
+        // Update session: increment turn count and clear follow-up flag
+        const newTurnCount = session.turnCount + 1;
+        const isSessionFinished = newTurnCount >= session.maxTurns;
+
+        db.updateSession(session.id, {
+          turnCount: newTurnCount,
+          awaitingFollowup: false,
+          followupHistory: updatedHistory,
+          status: isSessionFinished ? "completed" : "interviewing",
+        });
+
+        let report: Report | null = null;
+        if (isSessionFinished) {
+          const questionsList = db.getQuestionsBySessionId(session.id);
+          const benchmark = await runIndustryBenchmark(session.role, session.jdText);
+          report = await runReportGenerator(session, questionsList, benchmark);
+        }
+
+        // Return standard response structured properly
+        return res.json({
+          evaluation: {
+            technical_correctness: followupEval.pressure_handling,
+            completeness: followupEval.pressure_handling,
+            communication_clarity: followupEval.pressure_handling,
+            relevance: followupEval.pressure_handling,
+            use_of_examples: followupEval.pressure_handling,
+            overall_score: followupEval.pressure_handling,
+            justification: followupEval.justification,
+            pressure_handling: followupEval.pressure_handling,
+          },
+          coaching: {
+            strengths: ["Demonstrated composure under adversarial follow-up scrutiny", "Responded to targeted pushback"],
+            gaps: followupEval.pressure_handling < 7 ? ["Struggled to defend assumptions robustly under scale conditions"] : [],
+            suggested_improvement: "Maintain this clear, structured focus when asked unexpected follow-up scenarios.",
+            resource_topics: ["Pressure Management", "Trade-Off Analysis"],
+          },
+          isComplete: isSessionFinished,
+          report,
+          session: db.getSessionById(session.id),
+        });
+
+      } else {
+        // STANDARD (non-followup) question evaluation
+        const evaluation = await runEvaluator(question, answerText);
+        const coaching = await runCoach(question, answerText, evaluation);
+
+        let finalOverallScore = evaluation.overall_score;
+        if (question.hintRequested) {
+          finalOverallScore = Math.max(1, finalOverallScore - 1);
+        }
+
+        // Save evaluation
+        db.updateQuestion(question.id, {
+          answerText,
+          scoreTechnical: evaluation.technical_correctness,
+          scoreCompleteness: evaluation.completeness,
+          scoreClarity: evaluation.communication_clarity,
+          scoreRelevance: evaluation.relevance,
+          scoreOverall: finalOverallScore,
+          justification: evaluation.justification,
+          feedbackStrengths: coaching.strengths,
+          feedbackGaps: coaching.gaps,
+          feedbackImprovement: coaching.suggested_improvement,
+        });
+
+        // Trigger condition: overall score >= 7 OR 40% random chance
+        const meetsScoreThreshold = finalOverallScore >= 7;
+        const randomChance = Math.random() < 0.40;
+        
+        if (meetsScoreThreshold || randomChance) {
+          console.log(`[Follow-Up Triggered] Score: ${finalOverallScore}, Random: ${randomChance}. Generating adversarial challenge.`);
+          
+          const followupResult = await runAdversarialFollowUp(question, answerText);
+          
+          // Create the follow-up question
+          const followupQ: Question = {
+            id: `q_f_${Math.random().toString(36).substring(2, 11)}`,
+            sessionId: session.id,
+            questionText: followupResult.followup_question,
+            expectedConcepts: [followupResult.expected_depth],
+            topic: `${question.topic} (Follow-Up Challenge)`,
+            difficulty: session.currentDifficulty,
+            orderIndex: question.orderIndex + 1,
+            answerText: null,
+            scoreTechnical: null,
+            scoreCompleteness: null,
+            scoreClarity: null,
+            scoreRelevance: null,
+            scoreOverall: null,
+            justification: null,
+            feedbackStrengths: null,
+            feedbackGaps: null,
+            feedbackImprovement: null,
+            hintRequested: false,
+            createdAt: new Date().toISOString(),
+            isFollowup: true,
+            followupTo: question.id,
+            challengeType: followupResult.challenge_type,
+          };
+          
+          db.createQuestion(followupQ);
+
+          const updatedHistory = session.followupHistory || [];
+          db.updateSession(session.id, {
+            awaitingFollowup: true,
+            followupHistory: updatedHistory,
+          });
+
+          // Send back response with evaluation, coaching, and notify the frontend that a follow-up is coming
+          return res.json({
+            evaluation: {
+              ...evaluation,
+              overall_score: finalOverallScore,
+            },
+            coaching,
+            isComplete: false,
+            report: null,
+            session: db.getSessionById(session.id),
+            hasFollowupTriggered: true,
+            followupQuestion: followupResult.followup_question,
+          });
+        }
+
+        // Standard flow if NO follow-up is triggered
+        const newTurnCount = session.turnCount + 1;
+        const isSessionFinished = newTurnCount >= session.maxTurns;
+
+        // Adjust difficulty via Router
+        const routingResult = runRouter(finalOverallScore, session.currentDifficulty);
+
+        db.updateSession(session.id, {
+          turnCount: newTurnCount,
+          currentDifficulty: session.difficultyMode === "fixed" ? session.currentDifficulty : routingResult.nextDifficulty,
+          status: isSessionFinished ? "completed" : "interviewing",
+        });
+
+        let report: Report | null = null;
+        if (isSessionFinished) {
+          const questionsList = db.getQuestionsBySessionId(session.id);
+          const benchmark = await runIndustryBenchmark(session.role, session.jdText);
+          report = await runReportGenerator(session, questionsList, benchmark);
+        }
+
+        return res.json({
+          evaluation: {
+            ...evaluation,
+            overall_score: finalOverallScore,
+          },
+          coaching,
+          isComplete: isSessionFinished,
+          report,
+          session: db.getSessionById(session.id),
+        });
       }
 
-      // Save question evaluation & coach metrics
-      db.updateQuestion(question.id, {
-        answerText,
-        scoreTechnical: evaluation.technical_correctness,
-        scoreCompleteness: evaluation.completeness,
-        scoreClarity: evaluation.communication_clarity,
-        scoreRelevance: evaluation.relevance,
-        scoreOverall: finalOverallScore,
-        justification: evaluation.justification,
-        feedbackStrengths: coaching.strengths,
-        feedbackGaps: coaching.gaps,
-        feedbackImprovement: coaching.suggested_improvement,
-      });
-
-      // Update session turn count
-      const newTurnCount = session.turnCount + 1;
-      const isSessionFinished = newTurnCount >= session.maxTurns;
-
-      // Adjust difficulty via Router
-      const routingResult = runRouter(finalOverallScore, session.currentDifficulty);
-
-      db.updateSession(session.id, {
-        turnCount: newTurnCount,
-        currentDifficulty: session.difficultyMode === "fixed" ? session.currentDifficulty : routingResult.nextDifficulty,
-        status: isSessionFinished ? "completed" : "interviewing",
-      });
-
-      let report: Report | null = null;
-      if (isSessionFinished) {
-        const questionsList = db.getQuestionsBySessionId(session.id);
-        const benchmark = await runIndustryBenchmark(session.role, session.jdText);
-        report = await runReportGenerator(session, questionsList, benchmark);
-      }
-
-      return res.json({
-        evaluation: {
-          ...evaluation,
-          overall_score: finalOverallScore,
-        },
-        coaching,
-        isComplete: isSessionFinished,
-        report,
-        session: db.getSessionById(session.id),
-      });
     } catch (e: any) {
       console.error("Failed to process candidate's answer:", e);
       return res.status(500).json({ error: e.message });
@@ -733,259 +932,115 @@ async function startServer() {
   });
 
   // Beautiful styled printable / PDF fallback page for report downloads
-  app.get("/api/reports/:sessionId/pdf", (req, res) => {
+  app.get("/api/reports/:sessionId/pdf", authenticateToken, (req, res) => {
     try {
       const session = db.getSessionById(req.params.sessionId);
       if (!session) {
-        return res.status(404).send("Session not found");
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      if (session.userId !== req.user.id) {
+        return res.status(403).json({ error: "Unauthorized access to report" });
       }
 
       const report = db.getReportBySessionId(session.id);
       if (!report) {
-        return res.status(400).send("Report is not yet ready for this session.");
+        return res.status(400).json({ error: "Report is not yet ready for this session." });
       }
 
       const questions = db.getQuestionsBySessionId(session.id);
       const answered = questions.filter(q => q.answerText !== null);
 
-      // Return beautifully formatted PDF-printable HTML with print CSS automatically triggering window.print()
-      const html = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Interview Coach Report - ${session.role}</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    body {
-      font-family: 'Inter', sans-serif;
-      color: #1e293b;
-      background-color: #ffffff;
-      margin: 0;
-      padding: 40px;
-      line-height: 1.5;
-    }
-    .header {
-      border-b: 1px solid #e2e8f0;
-      padding-bottom: 24px;
-      margin-bottom: 32px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .title-area h1 {
-      margin: 0;
-      font-size: 28px;
-      font-weight: 700;
-      color: #1e1b4b;
-    }
-    .title-area p {
-      margin: 4px 0 0 0;
-      font-size: 14px;
-      color: #64748b;
-    }
-    .badge {
-      background-color: #4f46e5;
-      color: #ffffff;
-      padding: 6px 12px;
-      border-radius: 9999px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .metrics-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 20px;
-      margin-bottom: 32px;
-    }
-    .metric-card {
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 20px;
-      text-align: center;
-      background-color: #fafafa;
-    }
-    .metric-val {
-      font-size: 36px;
-      font-weight: 700;
-      color: #4f46e5;
-      margin: 8px 0;
-    }
-    .metric-label {
-      font-size: 12px;
-      text-transform: uppercase;
-      font-weight: 600;
-      color: #64748b;
-      letter-spacing: 0.05em;
-    }
-    .section {
-      margin-bottom: 32px;
-    }
-    .section-title {
-      font-size: 18px;
-      font-weight: 700;
-      color: #1e1b4b;
-      border-bottom: 2px solid #f1f5f9;
-      padding-bottom: 8px;
-      margin-bottom: 16px;
-    }
-    .list-item {
-      display: flex;
-      gap: 12px;
-      margin-bottom: 12px;
-      font-size: 14px;
-    }
-    .bullet {
-      width: 6px;
-      height: 6px;
-      background-color: #4f46e5;
-      border-radius: 50%;
-      margin-top: 8px;
-      flex-shrink: 0;
-    }
-    .qa-box {
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 16px;
-      margin-bottom: 20px;
-      background-color: #ffffff;
-      page-break-inside: avoid;
-    }
-    .qa-question {
-      font-weight: 600;
-      font-size: 14px;
-      margin-bottom: 8px;
-      color: #1e1b4b;
-    }
-    .qa-answer {
-      font-size: 13px;
-      color: #334155;
-      margin-bottom: 12px;
-      white-space: pre-wrap;
-      font-style: italic;
-      background-color: #f8fafc;
-      padding: 12px;
-      border-radius: 8px;
-    }
-    .qa-feedback {
-      display: flex;
-      gap: 16px;
-      font-size: 12px;
-    }
-    .qa-score {
-      font-weight: 700;
-      color: #10b981;
-    }
-    @media print {
-      body {
-        padding: 0;
+      // Initialize PDF Kit document
+      const doc = new PDFDocument({ margin: 50, size: "A4" });
+      
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="interview-report-${session.id}.pdf"`);
+      
+      doc.pipe(res);
+
+      // PDF styling and design - clean, minimalist and highly professional
+      doc.fillColor("#1e1b4b").fontSize(24).text("Adversarial Interview Coach", { align: "center" });
+      doc.moveDown(0.5);
+      doc.fillColor("#4f46e5").fontSize(12).text(`Candidate Interview Performance Report`, { align: "center" });
+      doc.moveDown(1.5);
+
+      // Section 1: Overview
+      doc.fillColor("#1e1b4b").fontSize(14).text("1. Session Metadata", { underline: true });
+      doc.moveDown(0.5);
+      doc.fillColor("#334155").fontSize(10);
+      doc.text(`Target Role: ${session.role}`);
+      doc.text(`Interview Type: ${session.type}`);
+      doc.text(`Date Concluded: ${new Date(report.createdAt).toLocaleDateString()}`);
+      doc.text(`Seniority Expectation Bar: ${report.expectedSeniorityBar}`);
+      doc.moveDown(1.5);
+
+      // Section 2: Metrics
+      doc.fillColor("#1e1b4b").fontSize(14).text("2. Key Performance Metrics", { underline: true });
+      doc.moveDown(0.5);
+      
+      // Draw a subtle background box for metrics
+      doc.rect(50, doc.y, 495, 80).fill("#f8fafc");
+      doc.fillColor("#1e1b4b").fontSize(12);
+      doc.text(`Overall Preparation Score: ${report.overallScore}%`, 70, doc.y + 15);
+      doc.text(`Job Description Alignment Match: ${report.alignmentJd}%`, 70, doc.y + 10);
+      doc.text(`Industry Standard Benchmark Bar: ${report.alignmentBenchmark}%`, 70, doc.y + 10);
+      if (report.pressureHandling !== undefined) {
+        doc.text(`Pressure Resilience Score: ${report.pressureHandling}%`, 70, doc.y + 10);
       }
-      .no-print {
-        display: none;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="no-print" style="background-color: #f1f5f9; padding: 12px; display: flex; justify-content: space-between; align-items: center; border-radius: 8px; margin-bottom: 24px;">
-    <span style="font-size: 13px; font-weight: 500; color: #475569;">This report is fully compiled. You can save or print it as a professional PDF.</span>
-    <button onclick="window.print()" style="background-color: #4f46e5; color: white; border: none; padding: 8px 16px; font-size: 12px; font-weight: 600; border-radius: 6px; cursor: pointer;">Print / Save PDF</button>
-  </div>
+      doc.moveDown(2);
 
-  <div class="header">
-    <div class="title-area">
-      <h1>Adversarial Interview Coach</h1>
-      <p>Session Report • ${session.role} (${session.type})</p>
-    </div>
-    <div class="badge">COMPLETED REPORT</div>
-  </div>
+      // Section 3: Strengths & Gaps
+      doc.fillColor("#1e1b4b").fontSize(14).text("3. Key Validated Strengths & Gaps", { underline: true });
+      doc.moveDown(0.5);
+      
+      doc.fillColor("#10b981").fontSize(11).text("Strengths Detected:");
+      doc.fillColor("#334155").fontSize(10);
+      report.strengths.forEach(s => doc.text(`• ${s}`));
+      doc.moveDown(0.8);
 
-  <div class="metrics-grid">
-    <div class="metric-card">
-      <div class="metric-label">Overall Match Score</div>
-      <div class="metric-val">${report.overallScore}/100</div>
-      <div style="font-size: 11px; color: #10b981; font-weight: 600;">STRONG PREPARATION</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-label">JD Alignment</div>
-      <div class="metric-val">${report.alignmentJd}%</div>
-      <div style="font-size: 11px; color: #64748b;">Target fit accuracy</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-label">Market Benchmark</div>
-      <div class="metric-val">${report.alignmentBenchmark}%</div>
-      <div style="font-size: 11px; color: #64748b;">Role seniority bar</div>
-    </div>
-  </div>
+      doc.fillColor("#ef4444").fontSize(11).text("Identified Development Gaps:");
+      doc.fillColor("#334155").fontSize(10);
+      report.gaps.forEach(g => doc.text(`• ${g}`));
+      doc.moveDown(1.5);
 
-  <div class="section">
-    <div class="section-title">Preparation Overview</div>
-    <p style="font-size: 14px; color: #475569;">
-      Based on the mock interview analysis, the candidate demonstrates an expected competency level fitting <strong>${report.expectedSeniorityBar}</strong>.
-      The system adjusted questions across various difficulty vectors dynamically. Below is an aggregated skill analysis of candidate responses.
-    </p>
-  </div>
+      // Section 4: Recommended Deep Study Topics
+      doc.fillColor("#1e1b4b").fontSize(14).text("4. Recommended Topics for Deep Study", { underline: true });
+      doc.moveDown(0.5);
+      doc.fillColor("#334155").fontSize(10);
+      report.recommendedTopics.forEach(t => doc.text(`• ${t}`));
+      doc.moveDown(1.5);
 
-  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-bottom: 32px;">
-    <div>
-      <div class="section-title">Validated Key Strengths</div>
-      ${report.strengths.map(s => `
-        <div class="list-item">
-          <div class="bullet"></div>
-          <div>${s}</div>
-        </div>
-      `).join("")}
-    </div>
-    <div>
-      <div class="section-title">Coaching Gaps & Remediation</div>
-      ${report.gaps.map(g => `
-        <div class="list-item">
-          <div class="bullet" style="background-color: #ef4444;"></div>
-          <div>${g}</div>
-        </div>
-      `).join("")}
-    </div>
-  </div>
+      // Section 5: Question History Transcripts
+      doc.addPage();
+      doc.fillColor("#1e1b4b").fontSize(14).text("5. Question Transcripts & Coaching Remediation", { underline: true });
+      doc.moveDown(1.0);
 
-  <div class="section" style="page-break-before: always;">
-    <div class="section-title">Recommended Deep Study Areas</div>
-    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-      ${report.recommendedTopics.map(t => `
-        <span style="background-color: #e0e7ff; color: #4338ca; padding: 6px 12px; font-size: 12px; font-weight: 500; border-radius: 6px;">${t}</span>
-      `).join("")}
-    </div>
-  </div>
+      answered.forEach((q, idx) => {
+        doc.fillColor("#1e1b4b").fontSize(11).text(`Q${idx + 1}: ${q.questionText}`);
+        doc.moveDown(0.3);
+        doc.fillColor("#475569").fontSize(9).text(`Your Answer: "${q.answerText || "(No Answer)"}"`, { oblique: true });
+        doc.moveDown(0.3);
+        
+        const typeLabel = q.isFollowup ? `Adversarial Follow-Up (Pressure)` : `Core Topic (${q.difficulty})`;
+        doc.fillColor("#4f46e5").fontSize(9).text(`Type: ${typeLabel} | Overall Score: ${q.scoreOverall}/10`);
+        
+        doc.fillColor("#10b981").fontSize(9).text(`Justification: ${q.justification || "Evaluated correctly."}`);
+        if (q.feedbackImprovement) {
+          doc.fillColor("#3b82f6").fontSize(9).text(`Coaching: ${q.feedbackImprovement}`);
+        }
+        doc.moveDown(1.2);
+        
+        // Prevent drawing text off-page
+        if (doc.y > 700) {
+          doc.addPage();
+        }
+      });
 
-  <div class="section">
-    <div class="section-title">Q&A transcript History</div>
-    ${answered.map((q, idx) => `
-      <div class="qa-box">
-        <div class="qa-question">Q${idx + 1}: ${q.questionText}</div>
-        <div class="qa-answer">"${q.answerText}"</div>
-        <div class="qa-feedback">
-          <div><strong style="color: #4f46e5;">Score:</strong> <span class="qa-score">${q.scoreOverall}/10</span></div>
-          <div><strong style="color: #4f46e5;">Topic:</strong> <span>${q.topic} (${q.difficulty})</span></div>
-        </div>
-        <div style="font-size: 12px; margin-top: 8px; color: #64748b;">
-          <strong>Coach remediation:</strong> ${q.feedbackImprovement || "Excellent solid response."}
-        </div>
-      </div>
-    `).join("")}
-  </div>
-
-  <script>
-    // Auto-trigger print view for convenience
-    window.addEventListener('load', () => {
-      // Auto-triggering print can be done, but keeping it manual avoids breaking standard frame rendering.
-    });
-  </script>
-</body>
-</html>
-      `;
-
-      return res.send(html);
+      doc.end();
     } catch (e: any) {
-      return res.status(500).send(`Failed to generate printable report: ${e.message}`);
+      console.error("[PDF Gen Error]", e);
+      return res.status(500).json({ error: `Failed to compile PDF: ${e.message}` });
     }
   });
 

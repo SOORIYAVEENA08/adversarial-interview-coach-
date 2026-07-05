@@ -27,6 +27,7 @@ import {
   TrendingUp,
   Upload,
   User,
+  Mic,
   X,
 } from "lucide-react";
 import {
@@ -119,6 +120,64 @@ export default function App() {
   // Simulated drag-and-drop highlights
   const [jdDragged, setJdDragged] = useState(false);
   const [resumeDragged, setResumeDragged] = useState(false);
+
+  // Voice Speech API States
+  const [isRecording, setIsRecording] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(true);
+
+  const startVoiceInput = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setSpeechSupported(false);
+      alert("Voice input is not supported in this browser. Please try Chrome or Edge.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onstart = () => {
+      setIsRecording(true);
+    };
+
+    recognition.onerror = (e: any) => {
+      console.error("Speech recognition error", e);
+      setIsRecording(false);
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+    };
+
+    recognition.onresult = (event: any) => {
+      let interimTranscript = "";
+      let finalTranscript = "";
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
+        }
+      }
+
+      if (finalTranscript) {
+        setCandidateAnswer((prev) => prev + (prev.endsWith(" ") || !prev ? "" : " ") + finalTranscript);
+      }
+    };
+
+    (window as any)._activeRecognition = recognition;
+    recognition.start();
+  };
+
+  const stopVoiceInput = () => {
+    if ((window as any)._activeRecognition) {
+      (window as any)._activeRecognition.stop();
+    }
+    setIsRecording(false);
+  };
 
   // Fetch initial profile & sessions
   useEffect(() => {
@@ -665,6 +724,7 @@ export default function App() {
   };
 
   const [fileError, setFileError] = useState<string | null>(null);
+  const [isUploadingDocument, setIsUploadingDocument] = useState<boolean>(false);
 
   const handleRealFileUpload = async (type: "jd" | "resume", file: File) => {
     setFileError(null);
@@ -700,35 +760,38 @@ export default function App() {
         return;
       }
 
-      // Read text content
-      const textReader = new FileReader();
-      textReader.onload = (e) => {
-        try {
-          const text = e.target?.result as string;
-          if (!text || text.trim().length === 0) {
-            throw new Error("No readable text found inside document.");
-          }
-          if (type === "jd") {
-            setSetupJd(text);
-          } else {
-            setSetupResume(text);
-          }
-        } catch (err: any) {
-          setFileError(`Failed to extract text from document: ${err.message || "Unknown parsing issue."}. You can copy and paste the text manually below.`);
-        }
-      };
-      textReader.onerror = () => {
-        setFileError("Error reading file content. Please paste your text manually.");
-      };
+      setIsUploadingDocument(true);
 
-      if (isPdf || isDocx) {
-        // Text extraction wrapped in try/except returning actionable message
-        throw new Error("Standard browser binary PDF/DOCX files require a textual structure to extract client-side. Let's type or paste your credentials directly.");
+      const formData = new FormData();
+      formData.append("document", file);
+
+      const res = await fetch(`${API_URL}/api/upload-document`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("token")}`
+        },
+        body: formData
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "We couldn't read that file — try copying and pasting the text instead.");
+      }
+
+      const data = await res.json();
+      if (!data.text || data.text.trim().length === 0) {
+        throw new Error("No readable text found inside document.");
+      }
+
+      if (type === "jd") {
+        setSetupJd(data.text);
       } else {
-        textReader.readAsText(file);
+        setSetupResume(data.text);
       }
     } catch (err: any) {
-      setFileError(`Failed to parse binary document: ${err.message || "Format unsupported."}. Please copy and paste your text details directly into the text area below.`);
+      setFileError(`Failed to parse document: ${err.message || "Format unsupported."}. Please copy and paste your text details directly into the text area below.`);
+    } finally {
+      setIsUploadingDocument(false);
     }
   };
 
@@ -1635,7 +1698,26 @@ export default function App() {
                       <div>
                         <div className="flex justify-between items-center mb-1.5">
                           <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Your Answer (minimum 100 words recommended)</label>
-                          <span className="text-xs text-slate-400 font-medium">{candidateAnswer.split(/\s+/).filter(Boolean).length} words</span>
+                          <div className="flex items-center gap-3">
+                            {speechSupported ? (
+                              <button
+                                type="button"
+                                onClick={isRecording ? stopVoiceInput : startVoiceInput}
+                                className={`px-2.5 py-1 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all shadow-sm ${
+                                  isRecording 
+                                    ? "bg-red-500 hover:bg-red-600 text-white animate-pulse" 
+                                    : "bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-100"
+                                }`}
+                                title={isRecording ? "Stop voice transcription" : "Start voice transcription"}
+                              >
+                                <Mic className={`w-3.5 h-3.5 ${isRecording ? "animate-bounce" : ""}`} />
+                                <span>{isRecording ? "Recording Answer..." : "Voice Input"}</span>
+                              </button>
+                            ) : (
+                              <span className="text-[10px] text-slate-400 font-medium bg-slate-50 px-2 py-1 rounded border border-slate-100">Voice Input Unsupported</span>
+                            )}
+                            <span className="text-xs text-slate-400 font-medium">{candidateAnswer.split(/\s+/).filter(Boolean).length} words</span>
+                          </div>
                         </div>
                         <textarea
                           required
@@ -1860,15 +1942,37 @@ export default function App() {
                 >
                   Return to Dashboard
                 </button>
-                <a
-                  href={`${API_URL}/api/reports/${activeSession.id}/pdf`}
-                  target="_blank"
-                  rel="noreferrer"
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await fetch(`${API_URL}/api/reports/${activeSession.id}/pdf`, {
+                        headers: {
+                          "Authorization": `Bearer ${token || localStorage.getItem("token")}`
+                        }
+                      });
+                      if (!res.ok) {
+                        alert("Failed to compile or retrieve your custom PDF report.");
+                        return;
+                      }
+                      const blob = await res.blob();
+                      const url = window.URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = `interview-report-${activeSession.id}.pdf`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      window.URL.revokeObjectURL(url);
+                    } catch (e) {
+                      console.error("PDF download failure:", e);
+                      alert("An error occurred during PDF compiling.");
+                    }
+                  }}
                   className="px-4 py-2 text-sm font-semibold text-white bg-indigo-600 rounded-xl shadow-sm hover:bg-indigo-700 flex items-center gap-2 transition-colors"
                 >
                   <FileText className="w-4 h-4" />
                   <span>Download Premium PDF</span>
-                </a>
+                </button>
               </div>
             </header>
 
